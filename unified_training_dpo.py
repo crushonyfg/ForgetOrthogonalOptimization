@@ -1183,18 +1183,34 @@ class ESMFoldSubprocessRunner:
 
 
 def download_alphafold_pdb(accession: str, output_path: str, timeout: int) -> bool:
-    url = f"https://alphafold.ebi.ac.uk/files/AF-{accession}-F1-model_v4.pdb"
+    # AF DB 的文件版本会滚动（现为 v6），硬编码 v4 已 404。
+    # 先查官方 API 拿权威 pdbUrl；失败再按 新->旧 版本号兜底尝试。
+    urls: List[str] = []
     try:
-        with urlopen(url, timeout=timeout) as response:
-            payload = response.read()
-        if b"ATOM" not in payload:
-            return False
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "wb") as handle:
-            handle.write(payload)
-        return True
-    except (HTTPError, URLError, TimeoutError, OSError):
-        return False
+        with urlopen(f"https://alphafold.ebi.ac.uk/api/prediction/{accession}", timeout=timeout) as response:
+            meta = json.loads(response.read())
+        if isinstance(meta, list) and meta and meta[0].get("pdbUrl"):
+            urls.append(meta[0]["pdbUrl"])
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        pass
+    for v in (6, 5, 4):
+        u = f"https://alphafold.ebi.ac.uk/files/AF-{accession}-F1-model_v{v}.pdb"
+        if u not in urls:
+            urls.append(u)
+
+    for url in urls:
+        try:
+            with urlopen(url, timeout=timeout) as response:
+                payload = response.read()
+            if b"ATOM" not in payload:
+                continue
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "wb") as handle:
+                handle.write(payload)
+            return True
+        except (HTTPError, URLError, TimeoutError, OSError):
+            continue
+    return False
 
 
 def infer_pdb_from_sequence(model_esm, sequence: str) -> str:
