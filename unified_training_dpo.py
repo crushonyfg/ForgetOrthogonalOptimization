@@ -677,7 +677,9 @@ def normalize_label(label: str) -> str:
     normalized = str(label).strip().lower()
     if normalized.startswith("haz"):
         return "hazardous"
-    if normalized.startswith("ben"):
+    # 难例(hard_negative)本质是良性,训练/奖励按 benign(retain)处理;
+    # JSONL 里保留原始 label 由 CSV 决定,compute_metrics 仍按 hard_negative 分组评测
+    if normalized.startswith("ben") or normalized.startswith("hard"):
         return "benign"
     raise ValueError(f"Unsupported label: {label}")
 

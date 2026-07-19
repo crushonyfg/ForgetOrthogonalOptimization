@@ -23,6 +23,7 @@ def main():
     ap.add_argument("--max-len", type=int, default=1000)
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 个蛋白(调试)")
     ap.add_argument("--mask-seed", type=int, default=123)
+    ap.add_argument("--resume", action="store_true", help="续跑:跳过输出里已有的(蛋白,mask)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -51,11 +52,22 @@ def main():
                  timeout_s=int(getattr(cfg, "GRPO_ESMFOLD_SUBPROCESS_TIMEOUT", 180)))
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    # 续跑:读已完成的 (accession, mask_ratio)
+    done = set()
+    if args.resume and os.path.exists(args.out):
+        for line in open(args.out):
+            try:
+                r = json.loads(line); done.add((r["accession"], float(r["mask_ratio"])))
+            except Exception:
+                pass
+        print(f"[harness] resume: 已有 {len(done)} 个(蛋白,mask)记录,跳过", flush=True)
     n_done, t_start = 0, time.time()
     try:
-        with open(args.out, "w") as fout:
+        with open(args.out, "a" if args.resume else "w") as fout:
             for mr in ratios:
                 for si, s in enumerate(samples):
+                    if (s.accession, float(mr)) in done:
+                        continue
                     t0 = time.time()
                     try:
                         ref_path, chain_id = ensure_reference_pdb_for_sample(s, model_esm, cfg)

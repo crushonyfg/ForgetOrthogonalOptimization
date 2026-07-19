@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--resume", action="store_true", help="续跑:跳过输出里已有的毒素")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -56,10 +57,17 @@ def main():
                  timeout_s=int(getattr(cfg, "GRPO_ESMFOLD_SUBPROCESS_TIMEOUT", 180)))
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    done = set()
+    if args.resume and os.path.exists(args.out):
+        for line in open(args.out):
+            try: done.add(json.loads(line)["accession"])
+            except Exception: pass
+        print(f"[msa] resume: 已有 {len(done)} 个毒素,跳过", flush=True)
     n, t0 = 0, time.time()
     try:
-        with open(args.out, "w") as fout:
+        with open(args.out, "a" if args.resume else "w") as fout:
             for acc in toxins:
+                if acc in done: continue
                 tt = time.time(); s = samples[acc]; homs = ctx[acc]
                 try:
                     ref_path, _ = ensure_reference_pdb_for_sample(s, model_esm, cfg)
