@@ -232,8 +232,17 @@ class TrainingConfig:
     DPO_NUM_EPOCHS = 5
     # cluster_csv DPO：output 目录与 checkpoint 子目录命名标签
     DPO_RUN_NAME = "dpo_v260506"
-    
+
+    # NPO 参数 (Negative Preference Optimization, Zhang 2024, arXiv:2404.05868)
+    # 有界遗忘 + retain(benign + 训练难例);修 GA 崩溃
+    NPO_BETA = 0.1
+    NPO_HAZARD_SAMPLE_FRAC = 0.5   # 每步抽 hazardous 的概率(其余抽 retain)
+    NPO_KL_BETA = 0.01
+    HARD_NEG_TRAIN_CSV = os.path.join(PROJECT_ROOT, "dataset", "hard_negatives_train.csv")
+
     # GRPO 参数
+    # reward 类型:reconstruction_A(我们的 baseline,不用 FOO reward)| refusal(FOO 旧版)
+    GRPO_REWARD_TYPE = "reconstruction_A"
     GRPO_BETA = 0.001
     ADVANTAGE_SCALE_FACTOR = 5.0
     REWARD_SHAPING_ALPHA = 0.7
@@ -1653,6 +1662,20 @@ def compute_cluster_reward(label: str, rmsd: float, seq_id: float, mean_plddt: f
     return float(mean_plddt_to_quality_0_1(mean_plddt))
 
 
+def compute_reconstruction_reward(label, seq_id, tm, plddt):
+    """Reward A(reconstruction-发散 + foldability,不用 FOO reward):
+    - hazard:奖励"远离目标毒素(低 id、低 TM)但仍能折叠(高 pLDDT)"= detoxify;
+    - retain:奖励"忠实复现(高 id、高 TM、高 pLDDT)"。
+    引 GRPO 算法(Shao 2024);reward 即评测目标写成奖励,非自创花活。"""
+    import numpy as _np
+    sid = float(_np.clip(_np.nan_to_num(seq_id, nan=0.0), 0, 1))
+    t = float(_np.clip(_np.nan_to_num(tm, nan=0.0), 0, 1))
+    pl = float(_np.clip(_np.nan_to_num(plddt, nan=0.0), 0, 1))
+    if normalize_label(label) == "hazardous":
+        return (1.0 - sid) * (1.0 - t) * pl
+    return sid * t * pl
+
+
 def evaluate_cluster_variant(
     sample: SequenceSample,
     variant_sequence: str,
@@ -1694,6 +1717,16 @@ def evaluate_cluster_variant(
             "num_x": num_x,
         }
 
+    if str(getattr(config, "GRPO_REWARD_TYPE", "reconstruction_A")) == "seqonly_A":
+        # fold-free reward(DPO/NPO 用):只按对目标毒素的序列 identity 发散度,不折叠
+        sid = seq_identity(variant_sequence, sample.sequence)
+        r = (1.0 - sid) if normalize_label(sample.label) == "hazardous" else sid
+        return {"step": step, "sample_index": sample_index, "accession": sample.accession,
+                "label": sample.label, "reward": float(r), "rmsd": float("nan"),
+                "seq_identity": float(sid), "plddt": float("nan"), "alntmscore": float("nan"),
+                "qtmscore": float("nan"), "ttmscore": float("nan"), "sequence": variant_sequence,
+                "timestamp": time.time(), "refusal": False, "num_x": 0}
+
     gen_pdb_path, mean_plddt = ensure_generated_pdb_for_sequence(sample, variant_sequence, model_esm, config)
     logger.info(
         "[Eval] step=%d accession=%s sample_idx=%d after_esmfold pdb=%s plddt=%.4f",
@@ -1725,7 +1758,9 @@ def evaluate_cluster_variant(
         )
         tm_key = str(getattr(config, "CLUSTER_REWARD_TM_METRIC", "qtmscore"))
         tm_val = float(tm_metrics.get(tm_key, tm_metrics["qtmscore"]))
-        if getattr(config, "CLUSTER_REWARD_USE_REFUSAL", True):
+        if str(getattr(config, "GRPO_REWARD_TYPE", "reconstruction_A")) == "reconstruction_A":
+            reward = compute_reconstruction_reward(sample.label, seq_id, tm_val, mean_plddt)
+        elif getattr(config, "CLUSTER_REWARD_USE_REFUSAL", True):
             reward = compute_cluster_reward_refusal(
                 sample.label, rmsd, seq_id, mean_plddt, tm_val, refusal, config
             )
@@ -1760,6 +1795,20 @@ def compute_dpo_loss(logp_pos, logp_neg, ref_logp_pos, ref_logp_neg, beta=Traini
     """计算 DPO loss"""
     logits = beta * ((logp_pos - logp_neg) - (ref_logp_pos - ref_logp_neg))
     return -F.logsigmoid(logits).mean()
+
+
+def seq_logp_teacher_forced(log_probs, S, loss_mask):
+    """teacher-forcing 下的序列 log-prob = Σ log p(真残基)。log_probs:[B,L,21], S:[B,L]"""
+    token_logp = torch.gather(log_probs, 2, S.unsqueeze(-1)).squeeze(-1)
+    return (token_logp * loss_mask).sum(dim=1)
+
+
+def compute_npo_loss(seq_logp, ref_seq_logp, beta=TrainingConfig.NPO_BETA):
+    """NPO 遗忘损失 (Zhang 2024, arXiv:2404.05868):
+    把 forget 序列的概率压到 ref 以下,梯度有界(不像 GA 无界会崩)。
+    L = -(2/β) log σ(-β (logπ_θ - logπ_ref))"""
+    diff = seq_logp - ref_seq_logp
+    return -(2.0 / beta) * F.logsigmoid(-beta * diff).mean()
 
 
 def reshape_rewards(rewards, alpha=TrainingConfig.REWARD_SHAPING_ALPHA):
@@ -4283,6 +4332,94 @@ def train_sft_ga_cluster():
     return os.path.join(dirs["checkpoint"], f"ga_sft_ep{n_epochs}.pt"), dirs["prefix"]
 
 
+def train_npo_cluster():
+    """NPO+RT (Zhang 2024):hazardous 用 NPO 有界遗忘;retain(benign + 训练难例)用 NLL+KL 梯度下降。
+    每步按 NPO_HAZARD_SAMPLE_FRAC 抽 hazard/retain;log 间隔存 checkpoint 供帕累托轨迹。"""
+    if not SFT_AVAILABLE:
+        raise ImportError("NPO requires training.utils / model_utils")
+    config = TrainingConfig
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dirs = config.get_output_dirs("sft_ga")  # 复用 sft 类目录布局
+    ckdir = dirs["checkpoint"]; os.makedirs(ckdir, exist_ok=True)
+
+    samples = load_cluster_samples_with_local_pdb(config.GRPO_TRAIN_CSV, config, "train")
+    hazard = [s for s in samples if s.label == "hazardous"]
+    retain = [s for s in samples if s.label == "benign"]
+    # 加入训练难例(无泄漏,来自 train 毒素同源)到 retain
+    if os.path.exists(config.HARD_NEG_TRAIN_CSV):
+        hn = load_cluster_samples_with_local_pdb(config.HARD_NEG_TRAIN_CSV, config, "train")
+        retain += hn
+        logger.info("NPO: 加入训练难例 %d 条(有本地结构的)到 retain", len(hn))
+    if not hazard or not retain:
+        raise RuntimeError("NPO 需要 hazardous 和 retain 各至少一条(带本地 PDB)")
+    logger.info("NPO+RT: hazard=%d retain(benign+难例)=%d", len(hazard), len(retain))
+
+    checkpoint = torch.load(config.PATH_TO_MODEL_WEIGHTS, map_location=device, weights_only=False)
+    def _mk():
+        m = ProteinMPNN(ca_only=False, num_letters=21, node_features=128, edge_features=128,
+                        hidden_dim=128, num_encoder_layers=3, num_decoder_layers=3,
+                        augment_eps=0.00, k_neighbors=checkpoint["num_edges"]).to(device)
+        m.load_state_dict(checkpoint["model_state_dict"]); return m
+    model = _mk(); model.train()
+    ref_model = _mk(); ref_model.eval()
+    for p in ref_model.parameters(): p.requires_grad = False
+
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    rng = random.Random(456)
+    n_epochs = int(config.CLUSTER_SFT_EPOCHS)
+    n_steps = max(1, len(samples))
+    p_h = float(config.NPO_HAZARD_SAMPLE_FRAC)
+    npo_beta = float(config.NPO_BETA); kl_beta = float(config.NPO_KL_BETA)
+    # log 间隔 checkpoint(轨迹用):全局 step 命中这些值时存
+    total_steps = n_epochs * n_steps
+    milestones = sorted(set([1] + [2**i for i in range(0, 20) if 2**i <= total_steps] + [total_steps]))
+    gstep = 0
+
+    def _fwd(model, s):
+        feat = featurize_cluster_accession_batch(s.accession, device, config, corrupted_seq=None)
+        X, S, mask, lengths, chain_M, chain_encoding_all, *_rest = feat
+        chain_M_pos = feat[10]; residue_idx = feat[12]
+        randn = torch.zeros_like(S, dtype=torch.float32, device=S.device)
+        lp = model(X, S, mask, chain_M * chain_M_pos, residue_idx, chain_encoding_all,
+                   randn=randn, use_input_decoding_order=False)
+        lm = mask * chain_M * chain_M_pos
+        return lp, S, lm
+
+    for epoch in range(n_epochs):
+        tl = 0.0; nu = 0
+        for _ in tqdm(range(n_steps), desc=f"npo_ep{epoch+1}"):
+            gstep += 1
+            is_h = rng.random() < p_h
+            s = rng.choice(hazard) if is_h else rng.choice(retain)
+            try:
+                lp, S, lm = _fwd(model, s)
+                with torch.no_grad():
+                    lp_ref, _, _ = _fwd(ref_model, s)
+                if is_h:
+                    # NPO 遗忘:序列级 log-prob 压到 ref 以下(有界)
+                    slp = seq_logp_teacher_forced(lp, S, lm)
+                    slp_ref = seq_logp_teacher_forced(lp_ref, S, lm)
+                    loss = compute_npo_loss(slp, slp_ref, npo_beta)
+                else:
+                    # retain:NLL 梯度下降 + KL
+                    _, loss_av = loss_smoothed(S, lp, lm)
+                    loss = loss_av + kl_beta * forward_kl(lp, lp_ref, lm)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                tl += float(loss.detach().cpu()); nu += 1
+                if gstep in milestones:
+                    torch.save({"model_state_dict": model.state_dict(), "num_edges": checkpoint["num_edges"],
+                                "gstep": gstep}, os.path.join(ckdir, f"npo_step{gstep}.pt"))
+            except Exception as exc:
+                logger.warning("NPO skip %s: %s", s.accession, exc)
+        logger.info("NPO epoch %d mean_loss=%.4f", epoch + 1, tl / max(1, nu))
+        torch.save({"model_state_dict": model.state_dict(), "num_edges": checkpoint["num_edges"],
+                    "epoch": epoch + 1}, os.path.join(ckdir, f"npo_ep{epoch+1}.pt"))
+    return os.path.join(ckdir, f"npo_ep{n_epochs}.pt"), dirs["prefix"]
+
+
 # =========================
 # 主函数
 # =========================
@@ -4294,6 +4431,7 @@ def main():
         choices=[
             "dpo",
             "grpo",
+            "npo",
             "sft",
             "sft_refusal",
             "sft_ga",
@@ -4301,7 +4439,7 @@ def main():
             "eval_cluster",
         ],
         required=True,
-        help="训练/工具：dpo, grpo, sft, sft_refusal, sft_ga, prefetch_pdbs, eval_cluster",
+        help="训练/工具：dpo, grpo, npo, sft, sft_refusal, sft_ga, prefetch_pdbs, eval_cluster",
     )
     parser.add_argument("--path-to-model-weights", type=str, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
@@ -4590,6 +4728,20 @@ def main():
             mask_ratios=[float(x.strip()) for x in str(args.eval_mask_ratios).split(",") if x.strip()],
             output_csv=explicit_csv,
             eval_run_dir=None if explicit_csv else run_prefix_ga,
+        )
+    elif method == "npo":
+        if not SFT_AVAILABLE:
+            logger.error("npo 需要 training.utils 与 model_utils")
+            return
+        logger.info("开始 Cluster NPO+RT")
+        ck_npo, run_prefix_npo = train_npo_cluster()
+        explicit_csv = getattr(args, "eval_output_csv", None)
+        run_cluster_test_evaluation(
+            TrainingConfig,
+            checkpoint_path=ck_npo,
+            mask_ratios=[float(x.strip()) for x in str(args.eval_mask_ratios).split(",") if x.strip()],
+            output_csv=explicit_csv,
+            eval_run_dir=None if explicit_csv else run_prefix_npo,
         )
     elif method == "sft":
         if not SFT_AVAILABLE:
